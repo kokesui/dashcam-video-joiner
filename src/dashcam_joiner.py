@@ -48,6 +48,17 @@ NORMALIZE_AUDIO_BITRATE = "192k"
 MODE_SAFE = "safe"   # 音ズレ対策モード (デフォルト)
 MODE_FAST = "fast"   # 高速・無劣化モード (非推奨)
 
+# 録画空白区間の扱い
+GAP_MODE_JOIN   = "join"    # 警告して1本に結合する（推奨）
+GAP_MODE_SPLIT  = "split"   # 空白区間で分割して複数ファイルにする
+GAP_MODE_STRICT = "strict"  # 空白区間があれば中止する
+
+GAP_MODE_LABEL: dict[str, str] = {
+    GAP_MODE_JOIN:   "警告して1本に結合",
+    GAP_MODE_SPLIT:  "空白区間で分割",
+    GAP_MODE_STRICT: "空白区間があれば中止",
+}
+
 
 # ---------------------------------------------------------------------------
 # App base directory
@@ -159,6 +170,116 @@ def check_interval(sorted_files: list[Path]) -> tuple[bool, list[str]]:
                 f" (差: {diff:.1f}秒, 許容: {INTERVAL_MIN}-{INTERVAL_MAX}秒)"
             )
     return len(errors) == 0, errors
+
+
+def check_interval_detailed(sorted_files: list[Path]) -> dict:
+    """
+    隣接ファイル間の時刻差を詳細分類する。
+
+    normal (29〜32秒)  : 通常連続区間
+    gap    (32秒超)    : 録画空白区間（駐車・休憩など）
+    overlap (29秒未満) : 重複・順序異常の疑い → 常にエラー
+
+    戻り値:
+        {
+            "normal_count":    int,
+            "gap_issues":      list[dict],     # kind="gap"
+            "overlap_issues":  list[dict],     # kind="overlap_or_short_interval"
+        }
+    各 issue dict: {kind, prev_file, curr_file, diff_seconds}
+    """
+    normal_count = 0
+    gap_issues: list[dict] = []
+    overlap_issues: list[dict] = []
+    datetimes = [parse_filename(f.name) for f in sorted_files]
+    for i in range(1, len(datetimes)):
+        prev_dt = datetimes[i - 1]
+        curr_dt = datetimes[i]
+        if prev_dt is None or curr_dt is None:
+            continue
+        diff = (curr_dt - prev_dt).total_seconds()
+        issue = {
+            "prev_file": sorted_files[i - 1],
+            "curr_file": sorted_files[i],
+            "diff_seconds": diff,
+        }
+        if INTERVAL_MIN <= diff <= INTERVAL_MAX:
+            normal_count += 1
+        elif diff > INTERVAL_MAX:
+            issue["kind"] = "gap"
+            gap_issues.append(issue)
+        else:  # diff < INTERVAL_MIN
+            issue["kind"] = "overlap_or_short_interval"
+            overlap_issues.append(issue)
+    return {
+        "normal_count": normal_count,
+        "gap_issues": gap_issues,
+        "overlap_issues": overlap_issues,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gap / segment helpers
+# ---------------------------------------------------------------------------
+
+def split_files_by_gaps(
+    sorted_files: list[Path],
+    gap_issues: list[dict],
+) -> list[list[Path]]:
+    """
+    gap_issues に基づいてファイルリストをセグメントに分割する。
+    gap の curr_file から新しいセグメントを開始する。
+    """
+    if not gap_issues:
+        return [list(sorted_files)]
+    gap_starts = {issue["curr_file"] for issue in gap_issues}
+    segments: list[list[Path]] = []
+    current: list[Path] = []
+    for f in sorted_files:
+        if f in gap_starts and current:
+            segments.append(current)
+            current = []
+        current.append(f)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _split_infos_by_segments(
+    infos: list[dict],
+    sorted_files: list[Path],
+    gap_issues: list[dict],
+) -> list[list[dict]]:
+    """gap_issues に基づいて infos を sorted_files と同じ分割でセグメント化する。"""
+    gap_starts = {issue["curr_file"] for issue in gap_issues}
+    seg_infos: list[list[dict]] = []
+    current: list[dict] = []
+    for f, info in zip(sorted_files, infos):
+        if f in gap_starts and current:
+            seg_infos.append(current)
+            current = []
+        current.append(info)
+    if current:
+        seg_infos.append(current)
+    return seg_infos
+
+
+def make_segment_output_path(
+    base_path: Path,
+    seg_idx: int,
+    seg_files: list[Path],
+) -> Path:
+    """分割セグメント用の出力ファイルパスを生成する。
+
+    例: final.mp4, seg_idx=1, files=[20260606_105002..., 20260606_105911...]
+    → final_part001_20260606_105002-20260606_105911.mp4
+    """
+    start_dt = parse_filename(seg_files[0].name)
+    end_dt = parse_filename(seg_files[-1].name)
+    start_str = start_dt.strftime("%Y%m%d_%H%M%S") if start_dt else "unknown"
+    end_str = end_dt.strftime("%Y%m%d_%H%M%S") if end_dt else "unknown"
+    name = f"{base_path.stem}_part{seg_idx:03d}_{start_str}-{end_str}{base_path.suffix}"
+    return base_path.parent / name
 
 
 # ---------------------------------------------------------------------------
@@ -647,6 +768,7 @@ def _run_pre_checks(
     output_path: Path,
     ffprobe_path: str,
     mode: str,
+    gap_mode: str,
     logger: Logger,
     log,
     ui_status_cb,
@@ -655,7 +777,7 @@ def _run_pre_checks(
 ) -> Optional[dict]:
     """
     共通事前チェック。
-    成功: dict(sorted_files, infos, warns, total_input_dur, fps_str)
+    成功: dict(sorted_files, infos, warns, total_input_dur, fps_str, gap_issues)
     失敗: None (ui_done_cb を呼んで return)
     """
     mode_label = "音ズレ対策モード (MP4出力)" if mode == MODE_SAFE else "高速・無劣化モード (AVI出力)"
@@ -688,17 +810,61 @@ def _run_pre_checks(
     for i, f in enumerate(sorted_files):
         logger.write(f"  [{i+1:03d}] {f.name}")
 
-    # 3. 時刻差チェック (29〜32秒)
+    # 3. 時刻差チェック
     ui_status_cb("時刻差チェック中...")
-    ok, errs = check_interval(sorted_files)
-    if not ok:
-        for e in errs:
-            log(f"[ERROR] {e}")
-        log("時刻差チェック: 失敗 — 結合を中止します")
+    interval_result = check_interval_detailed(sorted_files)
+    normal_cnt    = interval_result["normal_count"]
+    gap_issues    = interval_result["gap_issues"]
+    overlap_issues = interval_result["overlap_issues"]
+
+    log(
+        f"時刻差チェック: 通常連続 {normal_cnt}箇所 / "
+        f"録画空白 {len(gap_issues)}箇所 / "
+        f"危険な異常 {len(overlap_issues)}箇所"
+    )
+
+    # 29秒未満 (重複・順序異常) は gap_mode によらず常にエラー停止
+    if overlap_issues:
+        for issue in overlap_issues:
+            log(
+                f"[ERROR] 危険な時刻差: {issue['prev_file'].name} → {issue['curr_file'].name}"
+                f" (差: {issue['diff_seconds']:.1f}秒, 29秒未満)"
+            )
+        log("時刻差チェック: 失敗 — 危険な時刻差があるため結合を中止します")
         logger.write("結果: 失敗")
-        ui_done_cb(False, "時刻差チェックに失敗しました")
+        ui_done_cb(
+            False,
+            "危険な時刻差（29秒未満）を検出しました。\nファイルの順序や重複を確認してください。",
+        )
         return None
-    log("時刻差チェック: OK")
+
+    # 録画空白区間の処理
+    if gap_issues:
+        if gap_mode == GAP_MODE_STRICT:
+            for issue in gap_issues:
+                log(
+                    f"[ERROR] 録画空白区間を検出したため中止します: "
+                    f"{issue['prev_file'].name} → {issue['curr_file'].name}"
+                    f" (差: {issue['diff_seconds']:.1f}秒)"
+                )
+            log("時刻差チェック: 失敗 — 録画空白区間があるため中止します (厳密チェック)")
+            logger.write("結果: 失敗")
+            ui_done_cb(False, "録画空白区間を検出しました（厳密チェックモード）")
+            return None
+        else:
+            for issue in gap_issues:
+                log(
+                    f"[WARN] 録画空白区間: {issue['prev_file'].name}"
+                    f" → {issue['curr_file'].name}"
+                    f" (差: {issue['diff_seconds']:.1f}秒)"
+                )
+            if gap_mode == GAP_MODE_JOIN:
+                log("[INFO] 録画空白区間を検出しましたが、設定により1本の動画として結合を続行します")
+                log("[INFO] 空白時間は動画に挿入しません")
+            else:  # GAP_MODE_SPLIT
+                log(f"[INFO] 録画空白区間で {len(gap_issues) + 1} セグメントに分割します")
+    else:
+        log("時刻差チェック: OK")
 
     # 4. サマリー表示
     estimated_sec = len(sorted_files) * 30
@@ -742,6 +908,7 @@ def _run_pre_checks(
         "warns": warns,
         "total_input_dur": total_input_dur,
         "fps_str": fps_str,
+        "gap_issues": gap_issues,
     }
 
 
@@ -756,6 +923,7 @@ def _pipeline_safe(
     ffprobe_path: str,
     log_dir: Path,
     keep_intermediate: bool,
+    gap_mode: str,
     ui_log_cb,
     ui_status_cb,
     ui_done_cb,
@@ -774,7 +942,7 @@ def _pipeline_safe(
     try:
         result = _run_pre_checks(
             files, output_path, ffprobe_path,
-            MODE_SAFE, logger, log, ui_status_cb, ui_done_cb, probe_progress_cb,
+            MODE_SAFE, gap_mode, logger, log, ui_status_cb, ui_done_cb, probe_progress_cb,
         )
         if result is None:
             return
@@ -783,77 +951,122 @@ def _pipeline_safe(
         infos: list[dict] = result["infos"]
         warns: list[str] = result["warns"]
         fps_str: str = result["fps_str"]
+        gap_issues: list[dict] = result["gap_issues"]
 
         log(f"採用fps: {fps_str}")
+        logger.write(f"録画空白区間の扱い: {GAP_MODE_LABEL[gap_mode]}")
 
-        # Step 2: 作業ディレクトリ作成
+        # セグメント分割
+        if gap_issues and gap_mode == GAP_MODE_SPLIT:
+            segments = split_files_by_gaps(sorted_files, gap_issues)
+            seg_infos_list = _split_infos_by_segments(infos, sorted_files, gap_issues)
+            log(f"[INFO] 録画空白区間で {len(segments)} セグメントに分割します")
+            for si, seg in enumerate(segments):
+                log(f"[INFO] segment {si+1:03d}: {seg[0].name} → {seg[-1].name}, files={len(seg)}")
+        else:
+            segments = [sorted_files]
+            seg_infos_list = [infos]
+
+        # 作業ディレクトリ作成
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         work_dir = get_app_base_dir() / "work" / f"normalize_{ts}"
         work_dir.mkdir(parents=True, exist_ok=True)
         log(f"作業ディレクトリ: {work_dir}")
 
-        # Step 3: 各AVI → MP4 正規化
-        normalized_mp4s: list[Path] = []
-        normalized_durations: list[Optional[float]] = []
-        total = len(sorted_files)
-        for i, avi_file in enumerate(sorted_files):
-            mp4_path = work_dir / f"normalized_{i+1:04d}.mp4"
-            status_msg = f"正規化中 [{i+1}/{total}] {avi_file.name}"
-            log(status_msg)
-            ui_status_cb(status_msg)
+        total_files_all = sum(len(s) for s in segments)
+        output_files: list[Path] = []
+        all_dur_oks: list[bool] = []
+        all_dur_msgs: list[str] = []
+        global_file_idx = 0
 
-            ok, err_msg = normalize_avi_to_mp4(
-                ffmpeg_path, avi_file, mp4_path, fps_str, logger
+        for seg_idx, (seg_files, seg_infos) in enumerate(zip(segments, seg_infos_list)):
+            seg_prefix = f"seg{seg_idx+1:03d}_" if len(segments) > 1 else ""
+            seg_output = (
+                make_segment_output_path(output_path, seg_idx + 1, seg_files)
+                if len(segments) > 1 else output_path
             )
+
+            if len(segments) > 1:
+                log(
+                    f"--- セグメント {seg_idx+1}/{len(segments)}: "
+                    f"{seg_files[0].name} → {seg_files[-1].name} "
+                    f"({len(seg_files)}ファイル) ---"
+                )
+
+            # 各AVI → MP4 正規化
+            normalized_mp4s: list[Path] = []
+            normalized_durations: list[Optional[float]] = []
+
+            for i, avi_file in enumerate(seg_files):
+                global_file_idx += 1
+                mp4_path = work_dir / f"{seg_prefix}normalized_{i+1:04d}.mp4"
+                status_msg = f"正規化中 [{global_file_idx}/{total_files_all}] {avi_file.name}"
+                log(status_msg)
+                ui_status_cb(status_msg)
+
+                ok, err_msg = normalize_avi_to_mp4(
+                    ffmpeg_path, avi_file, mp4_path, fps_str, logger
+                )
+                if not ok:
+                    log(f"[ERROR] 正規化失敗: {avi_file.name} — {err_msg}")
+                    logger.write("結果: 失敗")
+                    ui_done_cb(False, f"正規化に失敗しました: {avi_file.name}\n{err_msg}")
+                    return
+                normalized_mp4s.append(mp4_path)
+                mp4_dur = probe_normalized_mp4_duration(ffprobe_path, mp4_path, logger)
+                dur_str = f"{mp4_dur:.2f}秒" if mp4_dur is not None else "N/A"
+                logger.write(f"正規化後duration [{i+1:03d}] {mp4_path.name}: {dur_str}")
+                normalized_durations.append(mp4_dur)
+
+            seg_label = f"セグメント {seg_idx+1:03d} " if len(segments) > 1 else "全"
+            log(f"{seg_label}ファイル正規化完了: {len(seg_files)}ファイル")
+
+            # concat list
+            concat_list_path = work_dir / f"{seg_prefix}list.txt"
+            make_concat_list(normalized_mp4s, concat_list_path)
+
+            # MP4 結合
+            seg_label2 = f"セグメント {seg_idx+1}/{len(segments)} " if len(segments) > 1 else ""
+            ui_status_cb(f"{seg_label2}正規化済みMP4を結合中...")
+            log(f"{seg_label2}正規化済みMP4を結合中...")
+            seg_output.parent.mkdir(parents=True, exist_ok=True)
+
+            ok, err_msg = run_mp4_concat(ffmpeg_path, concat_list_path, seg_output, logger)
             if not ok:
-                log(f"[ERROR] 正規化失敗: {avi_file.name} — {err_msg}")
+                log(f"[ERROR] {err_msg}")
                 logger.write("結果: 失敗")
-                ui_done_cb(False, f"正規化に失敗しました: {avi_file.name}\n{err_msg}")
+                ui_done_cb(False, f"結合に失敗しました: {err_msg}")
                 return
-            normalized_mp4s.append(mp4_path)
-            # 正規化後MP4のdurationを取得
-            mp4_dur = probe_normalized_mp4_duration(ffprobe_path, mp4_path, logger)
-            dur_str = f"{mp4_dur:.2f}秒" if mp4_dur is not None else "N/A"
-            logger.write(f"正規化後duration [{i+1:03d}] {mp4_path.name}: {dur_str}")
-            normalized_durations.append(mp4_dur)
+            log(f"結合完了: {seg_output.name}")
+            output_files.append(seg_output)
 
-        log(f"全ファイル正規化完了: {total}ファイル")
+            # duration 期待値を決定
+            logger.write("--- duration 比較基準の選定 ---")
+            expected_dur, basis_label = determine_expected_duration_for_audio_sync_mode(
+                seg_infos, normalized_durations, logger
+            )
 
-        # Step 4: concat list 作成
-        concat_list_path = work_dir / "normalized_list.txt"
-        make_concat_list(normalized_mp4s, concat_list_path)
-
-        # Step 5: MP4結合
-        ui_status_cb("正規化済みMP4を結合中...")
-        log("正規化済みMP4を結合中...")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        ok, err_msg = run_mp4_concat(ffmpeg_path, concat_list_path, output_path, logger)
-        if not ok:
-            log(f"[ERROR] {err_msg}")
-            logger.write("結果: 失敗")
-            ui_done_cb(False, f"結合に失敗しました: {err_msg}")
-            return
-        log("結合: 完了")
-
-        # Step 6: duration 期待値を決定
-        logger.write("--- duration 比較基準の選定 ---")
-        expected_dur, basis_label = determine_expected_duration_for_audio_sync_mode(
-            infos, normalized_durations, logger
-        )
-
-        # Step 7: 結合後 duration チェック
-        ui_status_cb("結合後 duration チェック中...")
-        dur_ok, dur_msg = check_output_duration(
-            ffprobe_path, output_path, expected_dur, basis_label, logger
-        )
-        log(f"結合後durationチェック: {dur_msg}")
+            # 結合後 duration チェック
+            ui_status_cb("結合後 duration チェック中...")
+            dur_ok, dur_msg = check_output_duration(
+                ffprobe_path, seg_output, expected_dur, basis_label, logger
+            )
+            log(f"結合後durationチェック: {dur_msg}")
+            all_dur_oks.append(dur_ok)
+            all_dur_msgs.append(dur_msg)
 
         success = True
         logger.write("結果: 成功")
-        msg = f"結合完了: {output_path.name}"
-        if not dur_ok:
-            msg += f"\n[警告] {dur_msg}"
+
+        # 完了メッセージ
+        if len(output_files) == 1:
+            msg = f"結合完了: {output_files[0].name}"
+        else:
+            file_list = "\n".join(f"  {f.name}" for f in output_files)
+            msg = f"分割結合完了: {len(output_files)} ファイル\n{file_list}"
+        dur_failed = [m for ok, m in zip(all_dur_oks, all_dur_msgs) if not ok]
+        if dur_failed:
+            msg += "\n[警告] " + " / ".join(dur_failed)
         if warns:
             msg += f"\n[注意] 事前チェックで {len(warns)} 件の警告がありました (ログ参照)"
         ui_done_cb(True, msg)
@@ -887,6 +1100,7 @@ def _pipeline_fast(
     ffmpeg_path: str,
     ffprobe_path: str,
     log_dir: Path,
+    gap_mode: str,
     ui_log_cb,
     ui_status_cb,
     ui_done_cb,
@@ -902,41 +1116,82 @@ def _pipeline_fast(
     try:
         result = _run_pre_checks(
             files, output_path, ffprobe_path,
-            MODE_FAST, logger, log, ui_status_cb, ui_done_cb, probe_progress_cb,
+            MODE_FAST, gap_mode, logger, log, ui_status_cb, ui_done_cb, probe_progress_cb,
         )
         if result is None:
             return
 
         sorted_files: list[Path] = result["sorted_files"]
+        infos: list[dict] = result["infos"]
         warns: list[str] = result["warns"]
-        total_input_dur: float = result["total_input_dur"]
+        gap_issues: list[dict] = result["gap_issues"]
 
-        # AVI 結合
+        logger.write(f"録画空白区間の扱い: {GAP_MODE_LABEL[gap_mode]}")
+
+        # セグメント分割
+        if gap_issues and gap_mode == GAP_MODE_SPLIT:
+            segments = split_files_by_gaps(sorted_files, gap_issues)
+            seg_infos_list = _split_infos_by_segments(infos, sorted_files, gap_issues)
+            log(f"[INFO] 録画空白区間で {len(segments)} セグメントに分割します")
+            for si, seg in enumerate(segments):
+                log(f"[INFO] segment {si+1:03d}: {seg[0].name} → {seg[-1].name}, files={len(seg)}")
+        else:
+            segments = [sorted_files]
+            seg_infos_list = [infos]
+
+        output_files: list[Path] = []
+        all_dur_oks: list[bool] = []
+        all_dur_msgs: list[str] = []
+
         ui_status_cb("結合中...")
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        for seg_idx, (seg_files, seg_infos) in enumerate(zip(segments, seg_infos_list)):
+            seg_output = (
+                make_segment_output_path(output_path, seg_idx + 1, seg_files)
+                if len(segments) > 1 else output_path
+            )
 
-        with tempfile.TemporaryDirectory() as tmp:
-            concat_list = make_concat_list(sorted_files, Path(tmp) / "concat_list.txt")
-            log(f"出力先: {output_path}")
-            ok, err_msg = run_ffmpeg_join(ffmpeg_path, concat_list, output_path, logger)
-            if not ok:
-                log(f"[ERROR] {err_msg}")
-                logger.write("結果: 失敗")
-                ui_done_cb(False, f"結合に失敗しました: {err_msg}")
-                return
-        log("結合: 完了")
+            if len(segments) > 1:
+                log(
+                    f"--- セグメント {seg_idx+1}/{len(segments)}: "
+                    f"{seg_files[0].name} → {seg_files[-1].name} "
+                    f"({len(seg_files)}ファイル) ---"
+                )
+                ui_status_cb(f"セグメント {seg_idx+1}/{len(segments)} 結合中...")
 
-        ui_status_cb("結合後 duration チェック中...")
-        dur_ok, dur_msg = check_output_duration(
-            ffprobe_path, output_path, total_input_dur,
-            "元AVI format.duration合計", logger
-        )
-        log(f"結合後durationチェック: {dur_msg}")
+            seg_output.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory() as tmp:
+                concat_list = make_concat_list(seg_files, Path(tmp) / "concat_list.txt")
+                log(f"出力先: {seg_output}")
+                ok, err_msg = run_ffmpeg_join(ffmpeg_path, concat_list, seg_output, logger)
+                if not ok:
+                    log(f"[ERROR] {err_msg}")
+                    logger.write("結果: 失敗")
+                    ui_done_cb(False, f"結合に失敗しました: {err_msg}")
+                    return
+            log(f"結合完了: {seg_output.name}")
+            output_files.append(seg_output)
+
+            seg_input_dur = sum(info.get("duration", 0.0) for info in seg_infos if info)
+            ui_status_cb("結合後 duration チェック中...")
+            dur_ok, dur_msg = check_output_duration(
+                ffprobe_path, seg_output, seg_input_dur,
+                "元AVI format.duration合計", logger
+            )
+            log(f"結合後durationチェック: {dur_msg}")
+            all_dur_oks.append(dur_ok)
+            all_dur_msgs.append(dur_msg)
 
         logger.write("結果: 成功")
-        msg = f"結合完了: {output_path.name}"
-        if not dur_ok:
-            msg += f"\n[警告] {dur_msg}"
+
+        # 完了メッセージ
+        if len(output_files) == 1:
+            msg = f"結合完了: {output_files[0].name}"
+        else:
+            file_list = "\n".join(f"  {f.name}" for f in output_files)
+            msg = f"分割結合完了: {len(output_files)} ファイル\n{file_list}"
+        dur_failed = [m for ok, m in zip(all_dur_oks, all_dur_msgs) if not ok]
+        if dur_failed:
+            msg += "\n[警告] " + " / ".join(dur_failed)
         if warns:
             msg += f"\n[注意] 事前チェックで {len(warns)} 件の警告がありました (ログ参照)"
         ui_done_cb(True, msg)
@@ -961,6 +1216,7 @@ def run_pipeline(
     log_dir: Path,
     mode: str,
     keep_intermediate: bool,
+    gap_mode: str,
     ui_log_cb,
     ui_status_cb,
     ui_done_cb,
@@ -970,12 +1226,12 @@ def run_pipeline(
     if mode == MODE_SAFE:
         _pipeline_safe(
             files, output_path, ffmpeg_path, ffprobe_path, log_dir,
-            keep_intermediate, ui_log_cb, ui_status_cb, ui_done_cb, probe_progress_cb,
+            keep_intermediate, gap_mode, ui_log_cb, ui_status_cb, ui_done_cb, probe_progress_cb,
         )
     else:
         _pipeline_fast(
             files, output_path, ffmpeg_path, ffprobe_path, log_dir,
-            ui_log_cb, ui_status_cb, ui_done_cb, probe_progress_cb,
+            gap_mode, ui_log_cb, ui_status_cb, ui_done_cb, probe_progress_cb,
         )
 
 
@@ -995,6 +1251,7 @@ class App(tk.Tk):
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._mode_var = tk.StringVar(value=MODE_SAFE)
         self._keep_intermediate_var = tk.BooleanVar(value=False)
+        self._gap_mode_var = tk.StringVar(value=GAP_MODE_JOIN)
 
         self._ffmpeg, self._ffprobe = find_ffmpeg()
 
@@ -1033,6 +1290,31 @@ class App(tk.Tk):
             variable=self._keep_intermediate_var,
         )
         self._keep_cb.grid(row=2, column=0, sticky="w", padx=24, pady=2)
+
+        # --- 録画空白区間の扱い ---
+        gap_frame = ttk.LabelFrame(self, text="録画空白区間の扱い", padding=8)
+        gap_frame.pack(fill="x", padx=10, pady=(2, 2))
+
+        ttk.Radiobutton(
+            gap_frame,
+            text="● 警告して1本に結合する（推奨）",
+            variable=self._gap_mode_var,
+            value=GAP_MODE_JOIN,
+        ).grid(row=0, column=0, sticky="w", padx=4, pady=2)
+
+        ttk.Radiobutton(
+            gap_frame,
+            text="○ 空白区間で分割して複数ファイルにする",
+            variable=self._gap_mode_var,
+            value=GAP_MODE_SPLIT,
+        ).grid(row=1, column=0, sticky="w", padx=4, pady=2)
+
+        ttk.Radiobutton(
+            gap_frame,
+            text="○ 空白区間があれば中止する（厳密チェック）",
+            variable=self._gap_mode_var,
+            value=GAP_MODE_STRICT,
+        ).grid(row=2, column=0, sticky="w", padx=4, pady=2)
 
         # --- 設定 ---
         top = ttk.LabelFrame(self, text="設定", padding=8)
@@ -1173,6 +1455,7 @@ class App(tk.Tk):
         log_dir = get_app_base_dir() / "logs"
         mode = self._mode_var.get()
         keep_intermediate = self._keep_intermediate_var.get()
+        gap_mode = self._gap_mode_var.get()
 
         def probe_progress(current: int, total: int) -> None:
             self._log_queue.put(f"ffprobe [{current}/{total}]...")
@@ -1191,6 +1474,7 @@ class App(tk.Tk):
                 log_dir,
                 mode,
                 keep_intermediate,
+                gap_mode,
                 lambda msg: self._log_queue.put(msg),
                 lambda msg: self.after(0, lambda m=msg: self._status_var.set(m)),
                 self._on_done,
