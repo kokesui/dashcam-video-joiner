@@ -1676,7 +1676,7 @@ class App(tk.Tk):
 
         self._encode_rb_cpu = ttk.Radiobutton(
             encode_frame,
-            text="● CPU安定・高画質（libx264 / CRF18）— 実績あり・推奨",
+            text="● CPU安定・高画質（libx264 / CRF18）— 保険・互換性重視",
             variable=self._encode_mode_var,
             value=ENCODE_MODE_CPU_STABLE,
         )
@@ -1684,7 +1684,7 @@ class App(tk.Tk):
 
         self._encode_rb_vcopy = ttk.Radiobutton(
             encode_frame,
-            text="○ 高速・映像コピー音声補正（映像copy / 音声AAC補正）— 42ファイルで確認済み・長時間は要検証",
+            text="○ 高速・映像コピー音声補正（映像copy / 音声AAC補正）— 実運用第一候補",
             variable=self._encode_mode_var,
             value=ENCODE_MODE_VIDEO_COPY,
         )
