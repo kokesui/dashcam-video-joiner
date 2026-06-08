@@ -32,3 +32,6 @@ ffprobe.exe
 # Windows
 Thumbs.db
 Desktop.ini
+
+# Release archives
+*.zip
