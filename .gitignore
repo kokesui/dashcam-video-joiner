@@ -12,6 +12,7 @@ dist/
 # App outputs
 logs/
 output/
+work/
 *.log
 
 # Video files
