@@ -437,14 +437,17 @@ def check_streams(
     ffprobe_path: str,
     logger: Logger,
     progress_cb,
-) -> tuple[bool, list[str], list[dict], list[str]]:
+) -> tuple[bool, list[str], list[dict], list[str], list[dict]]:
     """
     全ファイルのffprobe検査と仕様一致チェック。
-    戻り値: (ok, errors, infos, warnings)
+    戻り値: (ok, errors, infos, warnings, short_clip_candidates)
+    short_clip_candidates: 非最終ファイルで duration が 5〜29秒のファイル一覧。
+                           gap か overlap かは呼び出し元で次ファイルとの時刻差で判定する。
     """
     errors: list[str] = []
     warnings: list[str] = []
     infos: list[dict] = []
+    short_clip_candidates: list[dict] = []
     ref_video: Optional[dict] = None
     ref_audio: Optional[dict] = None
     total = len(files)
@@ -475,14 +478,29 @@ def check_streams(
                 errors.append(f"最終ファイルのdurationが短すぎます: {f.name} ({dur:.2f}秒)")
             elif dur < DURATION_MIN:
                 warnings.append(
-                    f"[WARN] 最終ファイルが短め: {f.name} ({dur:.2f}秒) — 結合は継続します"
+                    f"[WARN] 最終ファイルが短いですが許可します: {f.name} ({dur:.2f}秒)"
                 )
             elif dur > DURATION_MAX:
                 errors.append(f"最終ファイルのdurationが長すぎます: {f.name} ({dur:.2f}秒)")
         else:
-            if not (DURATION_MIN <= dur <= DURATION_MAX):
+            if dur < DURATION_LAST_WARN_MIN:
                 errors.append(
-                    f"duration異常: {f.name} ({dur:.2f}秒, 期待: {DURATION_MIN}-{DURATION_MAX}秒)"
+                    f"duration異常(短すぎ): {f.name} ({dur:.2f}秒, {DURATION_LAST_WARN_MIN}秒未満)"
+                )
+            elif dur < DURATION_MIN:
+                # 5.0〜29.0秒: 短い最終クリップ候補として記録し、後で時刻差で判定
+                logger.write(
+                    f"[INFO] 短いdurationのファイルを検出 (短い最終クリップ候補): "
+                    f"{f.name} ({dur:.2f}秒)"
+                )
+                short_clip_candidates.append({
+                    "file_index": i,
+                    "file": f,
+                    "duration": dur,
+                })
+            elif dur > DURATION_MAX:
+                errors.append(
+                    f"duration異常(長すぎ): {f.name} ({dur:.2f}秒, 期待: {DURATION_MAX}秒以下)"
                 )
 
         v_dur = info["video"].get("duration")
@@ -542,7 +560,7 @@ def check_streams(
     for w in warnings:
         logger.write(w)
     logger.write("--- ffprobe 検査終了 ---")
-    return len(errors) == 0, errors, infos, warnings
+    return len(errors) == 0, errors, infos, warnings, short_clip_candidates
 
 
 # ---------------------------------------------------------------------------
@@ -968,7 +986,7 @@ def _run_pre_checks(
 
     # 5. ffprobe 検査
     ui_status_cb("ffprobe 検査中...")
-    ok, errs, infos, warns = check_streams(
+    ok, errs, infos, warns, short_clip_candidates = check_streams(
         sorted_files, ffprobe_path, logger, probe_progress_cb
     )
     if warns:
@@ -1090,6 +1108,103 @@ def _run_pre_checks(
             f"短い最終クリップ後の録画再開 {short_clip_cnt}箇所 / "
             f"危険な異常 0箇所"
         )
+
+    # Step 5.6: 短いdurationの非最終クリップを次ファイルとの時刻差で gap/overlap 判定
+    if short_clip_candidates:
+        ui_status_cb("短いdurationファイルの詳細チェック中...")
+        short_dur_errors: list[str] = []
+        short_dur_allowed_cnt = 0
+
+        for candidate in short_clip_candidates:
+            ci  = candidate["file_index"]
+            f   = candidate["file"]
+            dur = candidate["duration"]
+
+            # short_clip_candidates は非最終ファイルのみなので sorted_files[ci+1] は必ず存在する
+            next_f = sorted_files[ci + 1]
+            curr_dt = parse_filename(f.name)
+            next_dt = parse_filename(next_f.name)
+
+            if curr_dt is None or next_dt is None:
+                log(
+                    f"[ERROR] 短いdurationファイルの時刻取得不可: {f.name} ({dur:.2f}秒)"
+                )
+                short_dur_errors.append(f"短いdurationファイルの時刻取得不可: {f.name}")
+                continue
+
+            diff_to_next = (next_dt - curr_dt).total_seconds()
+
+            if diff_to_next >= dur - SHORT_INTERVAL_TOLERANCE_SECONDS:
+                # 次ファイルは現クリップ再生終了後に始まる → 短い最終クリップとして許可
+                already_gap = any(
+                    g.get("prev_file") == f and g.get("curr_file") == next_f
+                    for g in gap_issues
+                )
+                if already_gap:
+                    # 既に gap_issues にある (長い録画空白 or short_clip_gap) → 重複登録しない
+                    log(
+                        f"[WARN] 録画空白直前の短い最終クリップを許可: {f.name}"
+                        f" (duration={dur:.2f}秒, 次ファイルまで={diff_to_next:.2f}秒)"
+                    )
+                else:
+                    # 新規 gap として追加
+                    log(
+                        f"[WARN] 短い最終クリップを録画空白扱いで許可: {f.name}"
+                        f" (duration={dur:.2f}秒, 次ファイルまで={diff_to_next:.2f}秒)"
+                    )
+                    new_gap: dict = {
+                        "kind": "short_duration_gap",
+                        "file_index": ci + 1,
+                        "prev_file": f,
+                        "curr_file": next_f,
+                        "diff_seconds": diff_to_next,
+                        "prev_duration": dur,
+                    }
+                    if gap_mode == GAP_MODE_STRICT:
+                        log(
+                            f"[ERROR] 短い最終クリップ後の録画空白を検出したため中止します: "
+                            f"{f.name} (duration={dur:.2f}秒, 次ファイルまで={diff_to_next:.2f}秒)"
+                        )
+                        short_dur_errors.append(
+                            f"短い最終クリップ後の録画空白 (厳密チェック): {f.name}"
+                        )
+                    else:
+                        gap_issues = gap_issues + [new_gap]
+                        if gap_mode == GAP_MODE_JOIN:
+                            log("[INFO] 設定により1本の動画として結合を続行します")
+                            log("[INFO] 空白時間は動画に挿入しません")
+                        else:  # GAP_MODE_SPLIT
+                            log("[INFO] 短い最終クリップ後の空白 (分割点候補)")
+                short_dur_allowed_cnt += 1
+            else:
+                # 次ファイルと重複の可能性 → エラー
+                log(
+                    f"[ERROR] 短いファイルが次ファイルと重複している可能性:"
+                    f" {f.name} → {next_f.name}"
+                    f" (duration={dur:.2f}秒, 次ファイルまで={diff_to_next:.2f}秒)"
+                )
+                short_dur_errors.append(
+                    f"duration異常(次ファイルと重複の疑い): {f.name}"
+                    f" ({dur:.2f}秒, 次まで{diff_to_next:.2f}秒)"
+                )
+
+        if short_dur_errors:
+            if gap_mode == GAP_MODE_STRICT:
+                log(
+                    "ffprobe検査: 失敗 — 短い最終クリップ後の録画空白があるため中止します"
+                    " (厳密チェック)"
+                )
+            else:
+                log("duration チェック: 失敗 — 短いdurationファイルに問題があります")
+            logger.write("結果: 失敗")
+            ui_done_cb(
+                False,
+                "短いdurationファイルの検証に失敗しました。\nログファイルを確認してください。",
+            )
+            return None
+
+        if short_dur_allowed_cnt > 0:
+            log(f"短い最終クリップ許可: {short_dur_allowed_cnt}件")
 
     return {
         "sorted_files": sorted_files,
