@@ -543,6 +543,7 @@ def check_output_duration(
     ffprobe_path: str,
     output_path: Path,
     expected_total: float,
+    basis_label: str,
     logger: Logger,
 ) -> tuple[bool, str]:
     """出力ファイルの duration と入力合計を比較する。"""
@@ -554,6 +555,7 @@ def check_output_duration(
     info = extract_stream_info(probe)
     actual = info["duration"]
     diff = abs(actual - expected_total)
+    logger.write(f"duration比較基準: {basis_label}")
     logger.write(f"入力duration合計: {expected_total:.2f}秒")
     logger.write(f"出力duration:     {actual:.2f}秒")
     logger.write(f"差分:             {diff:.2f}秒")
@@ -564,6 +566,76 @@ def check_output_duration(
         msg = f"duration差が {diff:.2f}秒 (許容: {DURATION_DIFF_WARN}秒以内) — 要確認"
         logger.write(f"[WARN] {msg}")
         return False, msg
+
+
+# ---------------------------------------------------------------------------
+# Duration helpers for audio sync mode
+# ---------------------------------------------------------------------------
+
+def probe_normalized_mp4_duration(
+    ffprobe_path: str,
+    mp4_path: Path,
+    logger: Logger,
+) -> Optional[float]:
+    """正規化後 MP4 の duration を ffprobe で取得する。取得不可は None。"""
+    probe = probe_file(ffprobe_path, mp4_path)
+    if probe is None:
+        logger.write(f"[WARN] 正規化後MP4のffprobe失敗: {mp4_path.name}")
+        return None
+    info = extract_stream_info(probe)
+    dur = info.get("duration")
+    if dur is None or dur <= 0:
+        logger.write(f"[WARN] 正規化後MP4のduration無効: {mp4_path.name} (dur={dur})")
+        return None
+    return dur
+
+
+def determine_expected_duration_for_audio_sync_mode(
+    infos: list[dict],
+    normalized_durations: list[Optional[float]],
+    logger: Logger,
+) -> tuple[float, str]:
+    """
+    音ズレ対策モードの duration 期待値を決定する。
+    優先1: 正規化後 MP4 duration 合計
+    優先2: 元 AVI video stream duration 合計
+    優先3: 元 AVI format.duration 合計 (fallback)
+    """
+    fmt_total = sum(info.get("duration", 0.0) for info in infos if info)
+
+    v_durs = [
+        info["video"].get("duration")
+        for info in infos
+        if info and info.get("video")
+    ]
+    v_total: Optional[float] = None
+    if len(v_durs) == len(infos) and all(d is not None and d > 0 for d in v_durs):
+        v_total = sum(v_durs)
+
+    norm_total: Optional[float] = None
+    if (
+        len(normalized_durations) == len(infos)
+        and all(d is not None and d > 0 for d in normalized_durations)
+    ):
+        norm_total = sum(normalized_durations)
+
+    # 診断ログ
+    logger.write(f"  元AVI format.duration合計:        {fmt_total:.2f}秒")
+    v_str = f"{v_total:.2f}秒" if v_total is not None else "N/A"
+    n_str = f"{norm_total:.2f}秒" if norm_total is not None else "N/A"
+    logger.write(f"  元AVI video stream duration合計:  {v_str}")
+    logger.write(f"  正規化後MP4 duration合計:         {n_str}")
+
+    if norm_total is not None:
+        logger.write("  採用: 正規化後MP4 duration合計")
+        return norm_total, "正規化後MP4 duration合計"
+
+    if v_total is not None:
+        logger.write("  [WARN] 正規化後MP4 duration一部取得不可 — 元AVI video stream duration合計を採用")
+        return v_total, "元AVI video stream duration合計"
+
+    logger.write("  [WARN] 正規化後MP4 / 元AVI video stream duration取得不可 — 元AVI format.duration合計を採用 (偽警告の可能性あり)")
+    return fmt_total, "元AVI format.duration合計"
 
 
 # ---------------------------------------------------------------------------
@@ -708,8 +780,8 @@ def _pipeline_safe(
             return
 
         sorted_files: list[Path] = result["sorted_files"]
+        infos: list[dict] = result["infos"]
         warns: list[str] = result["warns"]
-        total_input_dur: float = result["total_input_dur"]
         fps_str: str = result["fps_str"]
 
         log(f"採用fps: {fps_str}")
@@ -722,6 +794,7 @@ def _pipeline_safe(
 
         # Step 3: 各AVI → MP4 正規化
         normalized_mp4s: list[Path] = []
+        normalized_durations: list[Optional[float]] = []
         total = len(sorted_files)
         for i, avi_file in enumerate(sorted_files):
             mp4_path = work_dir / f"normalized_{i+1:04d}.mp4"
@@ -738,6 +811,11 @@ def _pipeline_safe(
                 ui_done_cb(False, f"正規化に失敗しました: {avi_file.name}\n{err_msg}")
                 return
             normalized_mp4s.append(mp4_path)
+            # 正規化後MP4のdurationを取得
+            mp4_dur = probe_normalized_mp4_duration(ffprobe_path, mp4_path, logger)
+            dur_str = f"{mp4_dur:.2f}秒" if mp4_dur is not None else "N/A"
+            logger.write(f"正規化後duration [{i+1:03d}] {mp4_path.name}: {dur_str}")
+            normalized_durations.append(mp4_dur)
 
         log(f"全ファイル正規化完了: {total}ファイル")
 
@@ -758,10 +836,16 @@ def _pipeline_safe(
             return
         log("結合: 完了")
 
-        # Step 6: duration チェック
+        # Step 6: duration 期待値を決定
+        logger.write("--- duration 比較基準の選定 ---")
+        expected_dur, basis_label = determine_expected_duration_for_audio_sync_mode(
+            infos, normalized_durations, logger
+        )
+
+        # Step 7: 結合後 duration チェック
         ui_status_cb("結合後 duration チェック中...")
         dur_ok, dur_msg = check_output_duration(
-            ffprobe_path, output_path, total_input_dur, logger
+            ffprobe_path, output_path, expected_dur, basis_label, logger
         )
         log(f"結合後durationチェック: {dur_msg}")
 
@@ -844,7 +928,8 @@ def _pipeline_fast(
 
         ui_status_cb("結合後 duration チェック中...")
         dur_ok, dur_msg = check_output_duration(
-            ffprobe_path, output_path, total_input_dur, logger
+            ffprobe_path, output_path, total_input_dur,
+            "元AVI format.duration合計", logger
         )
         log(f"結合後durationチェック: {dur_msg}")
 

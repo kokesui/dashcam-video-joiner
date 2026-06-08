@@ -160,7 +160,7 @@ dist\DashcamVideoJoiner\
 | 出力先上書き防止 | 出力先が入力ファイルと同じ場合は停止 |
 | **AVI→MP4 正規化 (音ズレ対策モード)** | PTS をリセットし音声タイムスタンプをならす |
 | **音声 AAC 再エンコード (音ズレ対策モード)** | 最終結合時も `aresample=async=1` で再同期 |
-| 結合後 duration 比較 | 入力合計と出力の長さを比較 (差 2 秒以内で OK) |
+| 結合後 duration 比較 | 入力合計と出力の長さを比較 (差 2 秒以内で OK)。**音ズレ対策モード**では正規化後 MP4 の duration 合計を基準とする（元 AVI の `format.duration` は実際の映像長より長い場合があるため）。**高速・無劣化モード**では元 AVI の `format.duration` 合計を基準とする |
 | 詳細ログ保存 | 全ファイルの ffprobe 結果・ffmpeg stderr を記録 |
 
 ---
