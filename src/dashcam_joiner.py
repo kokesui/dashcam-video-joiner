@@ -38,6 +38,9 @@ DURATION_LAST_WARN_MIN = 5.0
 DURATION_DIFF_WARN = 2.0
 AV_DURATION_DIFF_MAX = 0.5
 
+# 29秒未満の時刻差判定で使う許容誤差 (duration とファイル名時刻差のズレを吸収)
+SHORT_INTERVAL_TOLERANCE_SECONDS = 1.0
+
 # 正規化パラメータ (音ズレ対策モード)
 DEFAULT_FPS_STR = "55/2"          # fps取得不可時のデフォルト (27.5fps)
 NORMALIZE_CRF = 18
@@ -174,23 +177,26 @@ def check_interval(sorted_files: list[Path]) -> tuple[bool, list[str]]:
 
 def check_interval_detailed(sorted_files: list[Path]) -> dict:
     """
-    隣接ファイル間の時刻差を詳細分類する。
+    隣接ファイル間の時刻差を事前分類する。
 
-    normal (29〜32秒)  : 通常連続区間
-    gap    (32秒超)    : 録画空白区間（駐車・休憩など）
-    overlap (29秒未満) : 重複・順序異常の疑い → 常にエラー
+    normal  (29〜32秒) : 通常連続区間
+    gap     (32秒超)   : 録画空白区間（駐車・休憩など）
+    overlap (diff<=0)  : 重複・時計異常の疑い → 常にエラー
+    pending (0<diff<29): 前ファイルduration確認が必要 (ffprobe後に分類)
 
     戻り値:
         {
-            "normal_count":    int,
-            "gap_issues":      list[dict],     # kind="gap"
-            "overlap_issues":  list[dict],     # kind="overlap_or_short_interval"
+            "normal_count":         int,
+            "gap_issues":           list[dict],  # kind="gap"
+            "overlap_issues":       list[dict],  # kind="overlap_or_order_error" (diff<=0)
+            "pending_short_issues": list[dict],  # kind="needs_duration_check" (0<diff<29)
         }
-    各 issue dict: {kind, prev_file, curr_file, diff_seconds}
+    各 issue dict: {kind, file_index, prev_file, curr_file, diff_seconds}
     """
     normal_count = 0
     gap_issues: list[dict] = []
     overlap_issues: list[dict] = []
+    pending_short_issues: list[dict] = []
     datetimes = [parse_filename(f.name) for f in sorted_files]
     for i in range(1, len(datetimes)):
         prev_dt = datetimes[i - 1]
@@ -199,6 +205,7 @@ def check_interval_detailed(sorted_files: list[Path]) -> dict:
             continue
         diff = (curr_dt - prev_dt).total_seconds()
         issue = {
+            "file_index": i,            # curr_file の sorted_files 内インデックス
             "prev_file": sorted_files[i - 1],
             "curr_file": sorted_files[i],
             "diff_seconds": diff,
@@ -208,19 +215,90 @@ def check_interval_detailed(sorted_files: list[Path]) -> dict:
         elif diff > INTERVAL_MAX:
             issue["kind"] = "gap"
             gap_issues.append(issue)
-        else:  # diff < INTERVAL_MIN
-            issue["kind"] = "overlap_or_short_interval"
+        elif diff <= 0:
+            issue["kind"] = "overlap_or_order_error"
             overlap_issues.append(issue)
+        else:  # 0 < diff < INTERVAL_MIN
+            issue["kind"] = "needs_duration_check"
+            pending_short_issues.append(issue)
     return {
         "normal_count": normal_count,
         "gap_issues": gap_issues,
         "overlap_issues": overlap_issues,
+        "pending_short_issues": pending_short_issues,
     }
 
 
 # ---------------------------------------------------------------------------
 # Gap / segment helpers
 # ---------------------------------------------------------------------------
+
+def classify_short_intervals(
+    infos: list[dict],
+    pending_short_issues: list[dict],
+    logger: Logger,
+) -> tuple[list[dict], list[dict]]:
+    """
+    0 < diff < 29秒 の間隔を前ファイルの実 duration で分類する (ffprobe後に呼ぶ)。
+
+    判定基準 (previous_duration = prev_file の video stream duration 優先):
+        prev_duration <= diff + SHORT_INTERVAL_TOLERANCE_SECONDS
+            → short_clip_gap: 前ファイルが短く終わった後の録画再開 (gap 扱い)
+        prev_duration > diff + SHORT_INTERVAL_TOLERANCE_SECONDS
+            → overlap_or_order_error: 前ファイルと重複する疑い (常にエラー)
+        prev_duration 取得不可
+            → overlap_or_order_error (安全側)
+
+    Returns:
+        (short_clip_gaps, overlap_errors)
+    """
+    short_clip_gaps: list[dict] = []
+    overlap_errors: list[dict] = []
+
+    for issue in pending_short_issues:
+        idx = issue["file_index"]      # curr_file のインデックス
+        prev_idx = idx - 1             # prev_file のインデックス
+        diff = issue["diff_seconds"]
+
+        prev_info = infos[prev_idx] if 0 <= prev_idx < len(infos) else None
+
+        # previous_duration: video stream duration 優先、なければ format.duration
+        prev_duration: Optional[float] = None
+        if prev_info:
+            v = prev_info.get("video")
+            if v:
+                d = v.get("duration")
+                if d and d > 0:
+                    prev_duration = d
+            if prev_duration is None:
+                d = prev_info.get("duration")
+                if d and d > 0:
+                    prev_duration = d
+
+        new_issue = dict(issue)
+        new_issue["prev_duration"] = prev_duration
+
+        if prev_duration is None:
+            new_issue["kind"] = "overlap_or_order_error"
+            new_issue["no_duration"] = True
+            logger.write(
+                f"[WARN] 29秒未満の時刻差で前ファイルduration取得不可 → 安全側で危険な異常として扱います: "
+                f"{issue['prev_file'].name} → {issue['curr_file'].name}"
+                f" (差: {diff:.1f}秒)"
+            )
+            overlap_errors.append(new_issue)
+        elif prev_duration <= diff + SHORT_INTERVAL_TOLERANCE_SECONDS:
+            # 前ファイルが短く終わっている → 短い最終クリップ後の録画再開
+            new_issue["kind"] = "short_clip_gap"
+            short_clip_gaps.append(new_issue)
+        else:
+            # 前ファイルの再生中に次ファイルが始まっている → 重複の疑い
+            new_issue["kind"] = "overlap_or_order_error"
+            new_issue["no_duration"] = False
+            overlap_errors.append(new_issue)
+
+    return short_clip_gaps, overlap_errors
+
 
 def split_files_by_gaps(
     sorted_files: list[Path],
@@ -810,35 +888,41 @@ def _run_pre_checks(
     for i, f in enumerate(sorted_files):
         logger.write(f"  [{i+1:03d}] {f.name}")
 
-    # 3. 時刻差チェック
+    # 3. 時刻差チェック (ffprobe 前)
     ui_status_cb("時刻差チェック中...")
-    interval_result = check_interval_detailed(sorted_files)
-    normal_cnt    = interval_result["normal_count"]
-    gap_issues    = interval_result["gap_issues"]
-    overlap_issues = interval_result["overlap_issues"]
+    interval_result      = check_interval_detailed(sorted_files)
+    normal_cnt           = interval_result["normal_count"]
+    gap_issues           = interval_result["gap_issues"]
+    overlap_issues       = interval_result["overlap_issues"]
+    pending_short_issues = interval_result["pending_short_issues"]
 
+    pending_label = (
+        f" / 短い間隔(duration確認待ち) {len(pending_short_issues)}箇所"
+        if pending_short_issues else ""
+    )
     log(
         f"時刻差チェック: 通常連続 {normal_cnt}箇所 / "
         f"録画空白 {len(gap_issues)}箇所 / "
         f"危険な異常 {len(overlap_issues)}箇所"
+        f"{pending_label}"
     )
 
-    # 29秒未満 (重複・順序異常) は gap_mode によらず常にエラー停止
+    # diff <= 0 は常にエラー停止
     if overlap_issues:
         for issue in overlap_issues:
             log(
                 f"[ERROR] 危険な時刻差: {issue['prev_file'].name} → {issue['curr_file'].name}"
-                f" (差: {issue['diff_seconds']:.1f}秒, 29秒未満)"
+                f" (差: {issue['diff_seconds']:.1f}秒)"
             )
         log("時刻差チェック: 失敗 — 危険な時刻差があるため結合を中止します")
         logger.write("結果: 失敗")
         ui_done_cb(
             False,
-            "危険な時刻差（29秒未満）を検出しました。\nファイルの順序や重複を確認してください。",
+            "危険な時刻差（0秒以下）を検出しました。\nファイルの順序や重複を確認してください。",
         )
         return None
 
-    # 録画空白区間の処理
+    # 録画空白区間 (diff > 32秒) の処理
     if gap_issues:
         if gap_mode == GAP_MODE_STRICT:
             for issue in gap_issues:
@@ -862,8 +946,15 @@ def _run_pre_checks(
                 log("[INFO] 録画空白区間を検出しましたが、設定により1本の動画として結合を続行します")
                 log("[INFO] 空白時間は動画に挿入しません")
             else:  # GAP_MODE_SPLIT
-                log(f"[INFO] 録画空白区間で {len(gap_issues) + 1} セグメントに分割します")
-    else:
+                log(f"[INFO] 録画空白区間 {len(gap_issues)}箇所 を検出しました (分割点候補)")
+
+    if pending_short_issues:
+        log(
+            f"[INFO] 29秒未満の間隔が {len(pending_short_issues)}箇所 — "
+            f"ffprobe後に前ファイルdurationで詳細分類します"
+        )
+
+    if not gap_issues and not overlap_issues and not pending_short_issues:
         log("時刻差チェック: OK")
 
     # 4. サマリー表示
@@ -901,6 +992,104 @@ def _run_pre_checks(
     # fps (safe mode 用。fast mode では未使用)
     fps_str = get_normalize_fps(infos)
     logger.write(f"採用fps: {fps_str}")
+
+    # Step 5.5: 29秒未満の間隔を前ファイル duration で詳細分類 (ffprobe後)
+    short_clip_cnt = 0
+    if pending_short_issues:
+        ui_status_cb("短い間隔の詳細チェック中...")
+        short_clip_gaps, overlap_errors = classify_short_intervals(
+            infos, pending_short_issues, logger
+        )
+
+        # overlap_errors は常にエラー停止
+        if overlap_errors:
+            for issue in overlap_errors:
+                prev_dur = issue.get("prev_duration")
+                if issue.get("no_duration"):
+                    log(
+                        f"[ERROR] 29秒未満の時刻差を検出しましたが、前ファイルdurationを取得できないため"
+                        f"安全側で中止します: {issue['prev_file'].name} → {issue['curr_file'].name}"
+                        f" (差: {issue['diff_seconds']:.1f}秒)"
+                    )
+                else:
+                    log(
+                        f"[ERROR] 危険な時刻差: {issue['prev_file'].name} → {issue['curr_file'].name}"
+                        f" (差: {issue['diff_seconds']:.1f}秒,"
+                        f" 前ファイルduration: {prev_dur:.1f}秒)"
+                    )
+            log("時刻差チェック: 失敗 — 危険な時刻差があるため結合を中止します")
+            logger.write("結果: 失敗")
+            ui_done_cb(
+                False,
+                "危険な時刻差（重複または順序異常の疑い）を検出しました。\nログファイルを確認してください。",
+            )
+            return None
+
+        # short_clip_gaps の処理 (gap と同じ扱い)
+        short_clip_cnt = len(short_clip_gaps)
+        for issue in short_clip_gaps:
+            prev_dur = issue.get("prev_duration", 0.0)
+            log(
+                f"[WARN] 短い最終クリップ後の録画再開: {issue['prev_file'].name}"
+                f" → {issue['curr_file'].name}"
+                f" (差: {issue['diff_seconds']:.1f}秒, 前ファイルduration: {prev_dur:.1f}秒)"
+            )
+
+        if short_clip_gaps:
+            if gap_mode == GAP_MODE_STRICT:
+                for issue in short_clip_gaps:
+                    log(
+                        f"[ERROR] 録画空白区間を検出したため中止します: "
+                        f"{issue['prev_file'].name} → {issue['curr_file'].name}"
+                        f" (差: {issue['diff_seconds']:.1f}秒, 短い最終クリップ後の録画再開)"
+                    )
+                log("時刻差チェック: 失敗 — 録画空白区間があるため中止します (厳密チェック)")
+                logger.write("結果: 失敗")
+                ui_done_cb(False, "短い最終クリップ後の録画再開を検出しました（厳密チェックモード）")
+                return None
+            else:
+                if gap_mode == GAP_MODE_JOIN:
+                    log("[INFO] 設定により1本の動画として結合を続行します")
+                    log("[INFO] 空白時間は動画に挿入しません")
+                else:  # GAP_MODE_SPLIT
+                    log(f"[INFO] 短い最終クリップ後の録画再開 {len(short_clip_gaps)}箇所 (分割点候補)")
+
+        # short_clip_gaps を gap_issues に合流 (split_files_by_gaps で分割点として使う)
+        gap_issues = gap_issues + short_clip_gaps
+
+        # 長い録画空白区間の推定録画停止時間をログ (ファイルログのみ)
+        for issue in interval_result["gap_issues"]:
+            pi = issue["file_index"] - 1
+            if 0 <= pi < len(infos) and infos[pi]:
+                p_info = infos[pi]
+                p_dur: Optional[float] = None
+                v = p_info.get("video")
+                if v:
+                    d = v.get("duration")
+                    if d and d > 0:
+                        p_dur = d
+                if p_dur is None:
+                    d = p_info.get("duration")
+                    if d and d > 0:
+                        p_dur = d
+                if p_dur:
+                    stop_est = issue["diff_seconds"] - p_dur
+                    if stop_est > 0:
+                        logger.write(
+                            f"[INFO] 推定録画停止時間: {issue['prev_file'].name}"
+                            f" → {issue['curr_file'].name}"
+                            f" (前ファイルduration={p_dur:.1f}秒,"
+                            f" 時刻差={issue['diff_seconds']:.1f}秒,"
+                            f" 推定停止={stop_est:.1f}秒)"
+                        )
+
+        # 確定版サマリーログ
+        log(
+            f"時刻差チェック (確定): 通常連続 {normal_cnt}箇所 / "
+            f"録画空白 {len(gap_issues) - short_clip_cnt}箇所 / "
+            f"短い最終クリップ後の録画再開 {short_clip_cnt}箇所 / "
+            f"危険な異常 0箇所"
+        )
 
     return {
         "sorted_files": sorted_files,
