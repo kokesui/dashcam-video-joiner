@@ -6,14 +6,13 @@ Dashcam Video Joiner
 from __future__ import annotations
 
 import json
-import os
 import queue
 import re
 import subprocess
 import sys
 import tempfile
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +29,23 @@ FILENAME_PATTERN = re.compile(
 )
 DURATION_MIN = 29.0
 DURATION_MAX = 31.5
-DURATION_DIFF_WARN = 2.0  # seconds
+DURATION_LAST_WARN_MIN = 5.0   # 最終ファイル: これ未満はエラー停止
+DURATION_DIFF_WARN = 2.0       # 結合後 duration 許容差 (秒)
+AV_DURATION_DIFF_MAX = 0.5     # stream video/audio duration 差の上限 (秒)
+
+
+# ---------------------------------------------------------------------------
+# App base directory
+# ---------------------------------------------------------------------------
+
+def get_app_base_dir() -> Path:
+    """
+    PyInstaller (frozen) では exe の親ディレクトリ、
+    通常 Python では src/ の 2 階層上 (プロジェクトルート) を返す。
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -38,15 +53,8 @@ DURATION_DIFF_WARN = 2.0  # seconds
 # ---------------------------------------------------------------------------
 
 def _find_executable(name: str) -> Optional[str]:
-    """
-    tools/<name> → 同階層/<name> → PATH の順に探す。
-    PyInstaller(_MEIPASS) と 通常Python(__file__) の両方に対応。
-    """
-    if getattr(sys, "frozen", False):
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).parent.parent
-
+    """tools/<name> → 同階層/<name> → PATH の順に探す。"""
+    base = get_app_base_dir()
     candidates = [
         base / "tools" / name,
         base / name,
@@ -55,10 +63,8 @@ def _find_executable(name: str) -> Optional[str]:
         if path.is_file():
             return str(path)
 
-    # PATH search
     import shutil
-    found = shutil.which(name)
-    return found
+    return shutil.which(name)
 
 
 def find_ffmpeg() -> tuple[Optional[str], Optional[str]]:
@@ -77,7 +83,7 @@ class Logger:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.path = log_dir / f"join_{ts}.txt"
         self._file = open(self.path, "w", encoding="utf-8")
-        self.write(f"=== Dashcam Video Joiner Log ===")
+        self.write("=== Dashcam Video Joiner Log ===")
         self.write(f"実行日時: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         self.write("")
 
@@ -174,6 +180,18 @@ def probe_file(ffprobe_path: str, filepath: Path) -> Optional[dict]:
         return None
 
 
+def _parse_stream_duration(s: dict) -> Optional[float]:
+    """ストリームの duration フィールドを float で返す。取得不可は None。"""
+    raw = s.get("duration")
+    if raw is None:
+        return None
+    try:
+        val = float(raw)
+        return val if val > 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
 def extract_stream_info(probe: dict) -> dict:
     """プローブ結果から映像・音声情報を抽出する。"""
     info: dict = {"video": None, "audio": None, "duration": None}
@@ -193,12 +211,14 @@ def extract_stream_info(probe: dict) -> dict:
                 "width": s.get("width", 0),
                 "height": s.get("height", 0),
                 "fps": round(fps, 3),
+                "duration": _parse_stream_duration(s),
             }
         elif codec_type == "audio" and info["audio"] is None:
             info["audio"] = {
                 "codec": s.get("codec_name", ""),
                 "sample_rate": s.get("sample_rate", ""),
                 "channels": s.get("channels", 0),
+                "duration": _parse_stream_duration(s),
             }
 
     fmt = probe.get("format", {})
@@ -215,20 +235,23 @@ def check_streams(
     ffprobe_path: str,
     logger: Logger,
     progress_cb,
-) -> tuple[bool, list[str], list[dict]]:
+) -> tuple[bool, list[str], list[dict], list[str]]:
     """
     全ファイルのffprobe検査と仕様一致チェック。
-    progress_cb(current, total) で進捗通知。
+    戻り値: (ok, errors, infos, warnings)
+    warnings は停止しないが GUIとログに表示する。
     """
     errors: list[str] = []
+    warnings: list[str] = []
     infos: list[dict] = []
     ref_video: Optional[dict] = None
     ref_audio: Optional[dict] = None
+    total = len(files)
 
     logger.write("--- ffprobe 検査開始 ---")
 
     for i, f in enumerate(files):
-        progress_cb(i + 1, len(files))
+        progress_cb(i + 1, total)
         probe = probe_file(ffprobe_path, f)
         if probe is None:
             errors.append(f"ffprobe失敗: {f.name}")
@@ -246,13 +269,42 @@ def check_streams(
             errors.append(f"音声トラックなし: {f.name}")
             continue
 
-        # duration チェック (最終ファイル以外)
         dur = info["duration"]
-        is_last = (i == len(files) - 1)
-        if not is_last and not (DURATION_MIN <= dur <= DURATION_MAX):
-            errors.append(
-                f"duration異常: {f.name} ({dur:.2f}秒, 期待: {DURATION_MIN}-{DURATION_MAX}秒)"
-            )
+        is_last = (i == total - 1)
+
+        # duration チェック
+        if is_last:
+            if dur < DURATION_LAST_WARN_MIN:
+                errors.append(
+                    f"最終ファイルのdurationが短すぎます: {f.name} ({dur:.2f}秒)"
+                )
+            elif dur < DURATION_MIN:
+                warnings.append(
+                    f"[WARN] 最終ファイルが短め: {f.name} ({dur:.2f}秒) — 結合は継続します"
+                )
+            elif dur > DURATION_MAX:
+                errors.append(
+                    f"最終ファイルのdurationが長すぎます: {f.name} ({dur:.2f}秒)"
+                )
+        else:
+            if not (DURATION_MIN <= dur <= DURATION_MAX):
+                errors.append(
+                    f"duration異常: {f.name} ({dur:.2f}秒, 期待: {DURATION_MIN}-{DURATION_MAX}秒)"
+                )
+
+        # video / audio stream duration 差チェック
+        v_dur = info["video"].get("duration")
+        a_dur = info["audio"].get("duration")
+        if v_dur is not None and a_dur is not None:
+            av_diff = abs(v_dur - a_dur)
+            if av_diff > AV_DURATION_DIFF_MAX:
+                errors.append(
+                    f"映像/音声duration差が大きい: {f.name} "
+                    f"(video={v_dur:.2f}s, audio={a_dur:.2f}s, diff={av_diff:.2f}s)"
+                )
+        else:
+            logger.write(f"[INFO] stream duration取得不可: {f.name} "
+                         f"(video={v_dur}, audio={a_dur})")
 
         # 仕様一致チェック（基準は先頭ファイル）
         if ref_video is None:
@@ -262,16 +314,22 @@ def check_streams(
             v = info["video"]
             a = info["audio"]
             if v["codec"] != ref_video["codec"]:
-                errors.append(f"video codec不一致: {f.name} ({v['codec']} vs {ref_video['codec']})")
+                errors.append(
+                    f"video codec不一致: {f.name} ({v['codec']} vs {ref_video['codec']})"
+                )
             if v["width"] != ref_video["width"] or v["height"] != ref_video["height"]:
                 errors.append(
                     f"解像度不一致: {f.name} ({v['width']}x{v['height']} vs "
                     f"{ref_video['width']}x{ref_video['height']})"
                 )
             if abs(v["fps"] - ref_video["fps"]) > 0.1:
-                errors.append(f"fps不一致: {f.name} ({v['fps']} vs {ref_video['fps']})")
+                errors.append(
+                    f"fps不一致: {f.name} ({v['fps']} vs {ref_video['fps']})"
+                )
             if a["codec"] != ref_audio["codec"]:
-                errors.append(f"audio codec不一致: {f.name} ({a['codec']} vs {ref_audio['codec']})")
+                errors.append(
+                    f"audio codec不一致: {f.name} ({a['codec']} vs {ref_audio['codec']})"
+                )
             if a["sample_rate"] != ref_audio["sample_rate"]:
                 errors.append(
                     f"sample rate不一致: {f.name} ({a['sample_rate']} vs {ref_audio['sample_rate']})"
@@ -281,35 +339,43 @@ def check_streams(
                     f"channels不一致: {f.name} ({a['channels']} vs {ref_audio['channels']})"
                 )
 
+        v_dur_str = f"{v_dur:.2f}s" if v_dur is not None else "N/A"
+        a_dur_str = f"{a_dur:.2f}s" if a_dur is not None else "N/A"
         logger.write(
             f"  [{i+1:03d}] {f.name} | "
             f"video={info['video']['codec']} {info['video']['width']}x{info['video']['height']} "
-            f"{info['video']['fps']}fps | "
+            f"{info['video']['fps']}fps vdur={v_dur_str} | "
             f"audio={info['audio']['codec']} {info['audio']['sample_rate']}Hz "
-            f"ch={info['audio']['channels']} | "
-            f"dur={dur:.2f}s"
+            f"ch={info['audio']['channels']} adur={a_dur_str} | "
+            f"fmt_dur={dur:.2f}s"
         )
 
+    for w in warnings:
+        logger.write(w)
+
     logger.write("--- ffprobe 検査終了 ---")
-    return len(errors) == 0, errors, infos
+    return len(errors) == 0, errors, infos, warnings
 
 
 # ---------------------------------------------------------------------------
 # concat list generation
 # ---------------------------------------------------------------------------
 
+def escape_ffconcat_path(path: Path) -> str:
+    """
+    FFmpeg concat demuxer 用にパスをエスケープする。
+    Windows パスをスラッシュ正規化し、シングルクォートを '\'' にエスケープ。
+    """
+    posix_path = path.resolve().as_posix()
+    return posix_path.replace("'", r"'\''")
+
+
 def make_concat_list(files: list[Path], tmp_dir: Path) -> Path:
-    """
-    FFmpeg concat demuxer 用リストファイルを生成する。
-    パスはスラッシュ正規化、シングルクォートをエスケープ。
-    """
+    """FFmpeg concat demuxer 用リストファイルを生成する。"""
     list_path = tmp_dir / "concat_list.txt"
     with open(list_path, "w", encoding="utf-8") as f:
         for p in files:
-            # Windows パスをスラッシュ正規化
-            posix_path = p.resolve().as_posix()
-            # シングルクォートのエスケープ (concat demuxer: '' で表現)
-            escaped = posix_path.replace("'", "'\\''")
+            escaped = escape_ffconcat_path(p)
             f.write(f"file '{escaped}'\n")
     return list_path
 
@@ -324,14 +390,17 @@ def run_ffmpeg_join(
     output_path: Path,
     logger: Logger,
 ) -> tuple[bool, str]:
-    """FFmpeg concat demuxer で結合。(stdout, stderr をログへ)"""
+    """FFmpeg concat demuxer で結合。映像1本・音声1本のみコピー。"""
     cmd = [
         ffmpeg_path,
         "-y",
         "-f", "concat",
         "-safe", "0",
         "-i", str(concat_list),
-        "-map", "0",
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-dn",
+        "-sn",
         "-c", "copy",
         str(output_path),
     ]
@@ -417,6 +486,15 @@ def run_pipeline(
         ui_log_cb(msg)
 
     try:
+        # 0. 出力先上書き防止チェック
+        input_resolved = {p.resolve() for p in files}
+        if output_path.resolve() in input_resolved:
+            msg = "出力先が入力ファイルと同じです。元動画を上書きするため中止します。"
+            log(f"[ERROR] {msg}")
+            logger.write("結果: 失敗")
+            ui_done_cb(False, msg)
+            return
+
         # 1. ファイル名チェック
         ui_status_cb("ファイル名チェック中...")
         ok, errs = validate_filenames(files)
@@ -448,8 +526,6 @@ def run_pipeline(
         log("30秒間隔チェック: OK")
 
         # 4. 先頭・末尾情報
-        first_dt = parse_filename(sorted_files[0].name)
-        last_dt = parse_filename(sorted_files[-1].name)
         estimated_sec = len(sorted_files) * 30
         h, rem = divmod(estimated_sec, 3600)
         m, s = divmod(rem, 60)
@@ -461,9 +537,12 @@ def run_pipeline(
 
         # 5. ffprobe 検査
         ui_status_cb("ffprobe 検査中...")
-        ok, errs, infos = check_streams(
+        ok, errs, infos, warns = check_streams(
             sorted_files, ffprobe_path, logger, probe_progress_cb
         )
+        if warns:
+            for w in warns:
+                log(w)
         if not ok:
             for e in errs:
                 log(f"[ERROR] {e}")
@@ -474,6 +553,8 @@ def run_pipeline(
         log("動画トラック: OK")
         log("音声トラック: OK")
         log("動画/音声形式一致: OK")
+        if warns:
+            log(f"警告 {len(warns)} 件あり (詳細はログ参照)")
 
         # 入力 duration 合計
         total_input_dur = sum(
@@ -510,6 +591,8 @@ def run_pipeline(
         msg = f"結合完了: {output_path.name}"
         if not dur_ok:
             msg += f"\n[警告] {dur_msg}"
+        if warns:
+            msg += f"\n[注意] 事前チェックで {len(warns)} 件の警告がありました (ログ参照)"
         ui_done_cb(True, msg)
 
     except Exception as e:
@@ -535,7 +618,6 @@ class App(tk.Tk):
         self._output_path: Optional[Path] = None
         self._log_queue: queue.Queue[str] = queue.Queue()
 
-        # FFmpeg 検索
         self._ffmpeg, self._ffprobe = find_ffmpeg()
 
         self._build_ui()
@@ -547,7 +629,6 @@ class App(tk.Tk):
     def _build_ui(self) -> None:
         pad = {"padx": 8, "pady": 4}
 
-        # Top frame: file / output selection
         top = ttk.LabelFrame(self, text="設定", padding=8)
         top.pack(fill="x", padx=10, pady=6)
 
@@ -565,17 +646,14 @@ class App(tk.Tk):
 
         top.columnconfigure(1, weight=1)
 
-        # Status
         self._status_var = tk.StringVar(value="待機中")
         status_bar = ttk.Label(self, textvariable=self._status_var, anchor="w",
                                relief="sunken", padding=(6, 2))
         status_bar.pack(fill="x", padx=10, pady=(0, 2))
 
-        # Progress bar
         self._progress = ttk.Progressbar(self, mode="indeterminate")
         self._progress.pack(fill="x", padx=10, pady=(0, 4))
 
-        # Log area
         log_frame = ttk.LabelFrame(self, text="ログ", padding=4)
         log_frame.pack(fill="both", expand=True, padx=10, pady=4)
 
@@ -585,7 +663,6 @@ class App(tk.Tk):
         )
         self._log_text.pack(fill="both", expand=True)
 
-        # Bottom: start button
         self._start_btn = ttk.Button(
             self, text="結合開始", command=self._start_join, state="disabled"
         )
@@ -659,11 +736,16 @@ class App(tk.Tk):
         self._status_var.set("処理中...")
         self._clear_log()
 
-        log_dir = Path(__file__).parent.parent / "logs"
+        log_dir = get_app_base_dir() / "logs"
 
         def probe_progress(current: int, total: int) -> None:
             self._log_queue.put(f"ffprobe [{current}/{total}]...")
-            self._status_var.set(f"ffprobe 検査中 {current}/{total}")
+            self.after(
+                0,
+                lambda c=current, t=total: self._status_var.set(
+                    f"ffprobe 検査中 {c}/{t}"
+                ),
+            )
 
         thread = threading.Thread(
             target=run_pipeline,
