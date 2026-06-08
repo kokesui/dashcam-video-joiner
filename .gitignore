@@ -1,0 +1,33 @@
+﻿# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# App outputs
+logs/
+output/
+*.log
+
+# Video files
+*.AVI
+*.avi
+*.MP4
+*.mp4
+*.MOV
+*.mov
+
+# FFmpeg binaries
+tools/ffmpeg.exe
+tools/ffprobe.exe
+ffmpeg.exe
+ffprobe.exe
+
+# Windows
+Thumbs.db
+Desktop.ini
