@@ -51,6 +51,15 @@ NORMALIZE_AUDIO_BITRATE = "192k"
 MODE_SAFE = "safe"   # 音ズレ対策モード (デフォルト)
 MODE_FAST = "fast"   # 高速・無劣化モード (非推奨)
 
+# エンコード方式 (MODE_SAFE 内のサブオプション)
+ENCODE_MODE_CPU_STABLE = "cpu_stable"  # CPU安定・高画質 (libx264 / CRF18)
+ENCODE_MODE_VIDEO_COPY = "video_copy"  # 高速・映像コピー音声補正 (映像copy / 音声AAC補正)
+
+ENCODE_MODE_LABEL: dict[str, str] = {
+    ENCODE_MODE_CPU_STABLE: "CPU安定・高画質（libx264 / CRF18）",
+    ENCODE_MODE_VIDEO_COPY: "高速・映像コピー音声補正（映像copy / 音声AAC補正）",
+}
+
 # 録画空白区間の扱い
 GAP_MODE_JOIN   = "join"    # 警告して1本に結合する（推奨）
 GAP_MODE_SPLIT  = "split"   # 空白区間で分割して複数ファイルにする
@@ -660,6 +669,54 @@ def normalize_avi_to_mp4(
 
 
 # ---------------------------------------------------------------------------
+# Single AVI → MP4 normalization  (video copy mode, Step 2)
+# ---------------------------------------------------------------------------
+
+def normalize_avi_to_mp4_video_copy(
+    ffmpeg_path: str,
+    input_path: Path,
+    output_path: Path,
+    logger: Logger,
+) -> tuple[bool, str]:
+    """
+    1 つの AVI を MP4 に正規化する (高速・映像コピー音声補正モード)。
+    映像はコピー (-c:v copy)、音声のみ AAC 変換と同期補正を行う。
+    -vf / fps 補正は適用しない。
+    """
+    cmd = [
+        ffmpeg_path, "-y",
+        "-fflags", "+genpts",
+        "-i", str(input_path),
+        "-map", "0:v:0",
+        "-map", "0:a:0",
+        "-c:v", "copy",
+        "-af", "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0",
+        "-c:a", "aac",
+        "-ar", str(NORMALIZE_AUDIO_RATE),
+        "-b:a", NORMALIZE_AUDIO_BITRATE,
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    logger.write(f"正規化コマンド(映像copy) [{input_path.name}]: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=600,
+        )
+        logger.write(f"--- stderr [{input_path.name}] ---")
+        logger.write(result.stderr or "(なし)")
+        if "non monotonic" in result.stderr.lower() or "non-monotonic" in result.stderr.lower():
+            logger.write(f"[INFO] Non-monotonic DTS/PTS 検出: {input_path.name}")
+        if result.returncode != 0:
+            return False, f"ffmpeg終了コード: {result.returncode}"
+        return True, ""
+    except subprocess.TimeoutExpired:
+        return False, f"正規化タイムアウト (600秒超): {input_path.name}"
+    except OSError as e:
+        return False, f"ffmpeg起動エラー: {e}"
+
+
+# ---------------------------------------------------------------------------
 # Final MP4 concat  (safe mode, Step 3)
 # ---------------------------------------------------------------------------
 
@@ -1227,6 +1284,7 @@ def _pipeline_safe(
     ffprobe_path: str,
     log_dir: Path,
     keep_intermediate: bool,
+    encode_mode: str,
     gap_mode: str,
     ui_log_cb,
     ui_status_cb,
@@ -1259,6 +1317,15 @@ def _pipeline_safe(
 
         log(f"採用fps: {fps_str}")
         logger.write(f"録画空白区間の扱い: {GAP_MODE_LABEL[gap_mode]}")
+        logger.write(f"エンコード方式: {ENCODE_MODE_LABEL.get(encode_mode, encode_mode)}")
+
+        # エンコード方式ログ
+        if encode_mode == ENCODE_MODE_VIDEO_COPY:
+            log("[INFO] 高速・映像コピー音声補正モードを使用します")
+            log("[INFO] 映像は再エンコードせず copy します")
+            log("[INFO] 音声は AAC 48000Hz 192kbps へ変換し、aresample で同期補正します")
+        else:
+            log("[INFO] CPU安定・高画質モードを使用します (libx264 / CRF18 / veryfast)")
 
         # セグメント分割
         if gap_issues and gap_mode == GAP_MODE_SPLIT:
@@ -1308,9 +1375,14 @@ def _pipeline_safe(
                 log(status_msg)
                 ui_status_cb(status_msg)
 
-                ok, err_msg = normalize_avi_to_mp4(
-                    ffmpeg_path, avi_file, mp4_path, fps_str, logger
-                )
+                if encode_mode == ENCODE_MODE_VIDEO_COPY:
+                    ok, err_msg = normalize_avi_to_mp4_video_copy(
+                        ffmpeg_path, avi_file, mp4_path, logger
+                    )
+                else:
+                    ok, err_msg = normalize_avi_to_mp4(
+                        ffmpeg_path, avi_file, mp4_path, fps_str, logger
+                    )
                 if not ok:
                     log(f"[ERROR] 正規化失敗: {avi_file.name} — {err_msg}")
                     logger.write("結果: 失敗")
@@ -1520,6 +1592,7 @@ def run_pipeline(
     log_dir: Path,
     mode: str,
     keep_intermediate: bool,
+    encode_mode: str,
     gap_mode: str,
     ui_log_cb,
     ui_status_cb,
@@ -1530,7 +1603,8 @@ def run_pipeline(
     if mode == MODE_SAFE:
         _pipeline_safe(
             files, output_path, ffmpeg_path, ffprobe_path, log_dir,
-            keep_intermediate, gap_mode, ui_log_cb, ui_status_cb, ui_done_cb, probe_progress_cb,
+            keep_intermediate, encode_mode, gap_mode,
+            ui_log_cb, ui_status_cb, ui_done_cb, probe_progress_cb,
         )
     else:
         _pipeline_fast(
@@ -1554,6 +1628,7 @@ class App(tk.Tk):
         self._output_path: Optional[Path] = None
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._mode_var = tk.StringVar(value=MODE_SAFE)
+        self._encode_mode_var = tk.StringVar(value=ENCODE_MODE_CPU_STABLE)
         self._keep_intermediate_var = tk.BooleanVar(value=False)
         self._gap_mode_var = tk.StringVar(value=GAP_MODE_JOIN)
 
@@ -1594,6 +1669,26 @@ class App(tk.Tk):
             variable=self._keep_intermediate_var,
         )
         self._keep_cb.grid(row=2, column=0, sticky="w", padx=24, pady=2)
+
+        # --- エンコード方式 (音ズレ対策モード選択時のみ有効) ---
+        encode_frame = ttk.LabelFrame(self, text="エンコード方式（音ズレ対策モード選択時）", padding=8)
+        encode_frame.pack(fill="x", padx=10, pady=(2, 2))
+
+        self._encode_rb_cpu = ttk.Radiobutton(
+            encode_frame,
+            text="● CPU安定・高画質（libx264 / CRF18）— 実績あり・推奨",
+            variable=self._encode_mode_var,
+            value=ENCODE_MODE_CPU_STABLE,
+        )
+        self._encode_rb_cpu.grid(row=0, column=0, sticky="w", padx=4, pady=2)
+
+        self._encode_rb_vcopy = ttk.Radiobutton(
+            encode_frame,
+            text="○ 高速・映像コピー音声補正（映像copy / 音声AAC補正）— 42ファイルで確認済み・長時間は要検証",
+            variable=self._encode_mode_var,
+            value=ENCODE_MODE_VIDEO_COPY,
+        )
+        self._encode_rb_vcopy.grid(row=1, column=0, sticky="w", padx=4, pady=2)
 
         # --- 録画空白区間の扱い ---
         gap_frame = ttk.LabelFrame(self, text="録画空白区間の扱い", padding=8)
@@ -1672,6 +1767,9 @@ class App(tk.Tk):
         """モード変更時のUI更新。"""
         is_safe = (self._mode_var.get() == MODE_SAFE)
         self._keep_cb.config(state="normal" if is_safe else "disabled")
+        enc_state = "normal" if is_safe else "disabled"
+        self._encode_rb_cpu.config(state=enc_state)
+        self._encode_rb_vcopy.config(state=enc_state)
         # 出力先の拡張子がモードと合わない場合はリセット
         if self._output_path is not None:
             expected_ext = ".mp4" if is_safe else ".avi"
@@ -1759,6 +1857,7 @@ class App(tk.Tk):
         log_dir = get_app_base_dir() / "logs"
         mode = self._mode_var.get()
         keep_intermediate = self._keep_intermediate_var.get()
+        encode_mode = self._encode_mode_var.get()
         gap_mode = self._gap_mode_var.get()
 
         def probe_progress(current: int, total: int) -> None:
@@ -1778,6 +1877,7 @@ class App(tk.Tk):
                 log_dir,
                 mode,
                 keep_intermediate,
+                encode_mode,
                 gap_mode,
                 lambda msg: self._log_queue.put(msg),
                 lambda msg: self.after(0, lambda m=msg: self._status_var.set(m)),
