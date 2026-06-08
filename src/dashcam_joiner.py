@@ -1628,7 +1628,7 @@ class App(tk.Tk):
         self._output_path: Optional[Path] = None
         self._log_queue: queue.Queue[str] = queue.Queue()
         self._mode_var = tk.StringVar(value=MODE_SAFE)
-        self._encode_mode_var = tk.StringVar(value=ENCODE_MODE_CPU_STABLE)
+        self._encode_mode_var = tk.StringVar(value=ENCODE_MODE_VIDEO_COPY)
         self._keep_intermediate_var = tk.BooleanVar(value=False)
         self._gap_mode_var = tk.StringVar(value=GAP_MODE_JOIN)
 
